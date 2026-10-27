@@ -14,6 +14,7 @@ RECV_WINDOW = "5000"
 CACHE_TTL = 30
 SNAPSHOT_EVERY = int(os.getenv("SNAPSHOT_MINUTES", "15")) * 60
 WATCHLIST = [c.strip().upper() for c in os.getenv("WATCHLIST", "BTC,ETH,SOL").split(",") if c.strip()]
+DATABASE_URL = os.getenv("DATABASE_URL")
 DB_PATH = os.getenv("DB_PATH", "/data/history.db" if os.path.isdir("/data") else "history.db")
 STABLES = {"USDT", "USDC", "USD"}
 
@@ -38,7 +39,7 @@ def require_auth():
     user = os.getenv("PANEL_USER", "admin")
     pwd = os.getenv("PANEL_PASS")
     if not pwd:
-        return Response("Configurá PANEL_PASS en Railway > Variables", 503)
+        return Response("Configurá PANEL_PASS en las variables de entorno", 503)
     auth = request.authorization
     ok = (
         auth
@@ -72,7 +73,7 @@ def bybit_get(path, params, signed=True):
         key = os.getenv("BYBIT_KEY")
         secret = os.getenv("BYBIT_SECRET")
         if not key or not secret:
-            return {"retCode": -1, "retMsg": "Falta BYBIT_KEY o BYBIT_SECRET en Railway > Variables"}
+            return {"retCode": -1, "retMsg": "Falta BYBIT_KEY o BYBIT_SECRET en las variables de entorno"}
         ts = str(int(time.time() * 1000))
         payload = f"{ts}{key}{RECV_WINDOW}{query}"
         sign = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
@@ -98,7 +99,6 @@ def err_text(label, data):
     return f"{label}: {data.get('retCode')} - {data.get('retMsg')}"
 
 
-# --- Precios (endpoint público, no necesita firma) ---
 def fetch_prices():
     data = bybit_get("/v5/market/tickers", {"category": "spot"}, signed=False)
     if data.get("retCode") != 0:
@@ -120,7 +120,6 @@ def coin_price(coin, prices):
     return prices.get(coin, {}).get("price", 0.0)
 
 
-# --- Balances ---
 def fetch_unified():
     data = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
     if data.get("retCode") != 0:
@@ -151,7 +150,6 @@ def fetch_fund(prices):
     return coins, None
 
 
-# --- Posiciones ---
 def fetch_positions():
     data = bybit_get("/v5/position/list", {"category": "linear", "settleCoin": "USDT", "limit": 50})
     if data.get("retCode") != 0:
@@ -177,12 +175,12 @@ def fetch_closed_pnl():
         rows.append({
             "symbol": p.get("symbol"), "side": p.get("side"),
             "entry": to_float(p.get("avgEntryPrice")), "exit": to_float(p.get("avgExitPrice")),
-            "pnl": to_float(p.get("closedPnl")), "time": fmt_time(p.get("updatedTime") or p.get("createdTime")),
+            "pnl": to_float(p.get("closedPnl")),
+            "time": fmt_time(p.get("updatedTime") or p.get("createdTime")),
         })
     return rows, None
 
 
-# --- Dashboard completo ---
 def build_dashboard():
     errors = []
     prices, e = fetch_prices()
@@ -216,23 +214,46 @@ def get_dashboard(force=False):
     return cached("dash", build_dashboard)
 
 
-# ---------- Historial del balance (SQLite) ----------
+# ---------- Historial del balance (Postgres externo o SQLite) ----------
 def db():
+    if DATABASE_URL:
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn, conn.cursor() as cur:
+            cur.execute("CREATE TABLE IF NOT EXISTS snapshots (ts BIGINT PRIMARY KEY, equity DOUBLE PRECISION)")
+        return conn
     conn = sqlite3.connect(DB_PATH)
     conn.execute("CREATE TABLE IF NOT EXISTS snapshots (ts INTEGER PRIMARY KEY, equity REAL)")
     return conn
 
 
 def save_snapshot(equity):
-    with db() as conn:
-        conn.execute("INSERT OR REPLACE INTO snapshots VALUES (?, ?)", (int(time.time()), equity))
+    ts = int(time.time())
+    if DATABASE_URL:
+        conn = db()
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute("INSERT INTO snapshots VALUES (%s, %s) ON CONFLICT (ts) DO NOTHING", (ts, equity))
+        finally:
+            conn.close()
+    else:
+        with db() as conn:
+            conn.execute("INSERT OR REPLACE INTO snapshots VALUES (?, ?)", (ts, equity))
 
 
 def load_history(limit=500):
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT ts, equity FROM (SELECT ts, equity FROM snapshots ORDER BY ts DESC LIMIT ?) ORDER BY ts",
-            (limit,)).fetchall()
+    q = "SELECT ts, equity FROM (SELECT ts, equity FROM snapshots ORDER BY ts DESC LIMIT {p}) t ORDER BY ts"
+    if DATABASE_URL:
+        conn = db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(q.format(p="%s"), (limit,))
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    else:
+        with db() as conn:
+            rows = conn.execute(q.format(p="?"), (limit,)).fetchall()
     return [{"t": time.strftime("%d/%m %H:%M", time.gmtime(ts)), "v": round(eq, 2)} for ts, eq in rows]
 
 
@@ -341,46 +362,3 @@ TEMPLATE = """
 
 <div class="card" style="text-align:center">
   <small>Actualizado: {{ d.updated }} · caché {{ ttl }}s</small><br><br>
-  <button onclick="location.reload()">Recargar</button>
-</div>
-
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
-{% raw %}
-<script>
-fetch("/api/history").then(r => r.json()).then(rows => {
-  if (!rows.length) { document.getElementById("nohist").style.display = "block"; return; }
-  new Chart(document.getElementById("chart"), {
-    type: "line",
-    data: {
-      labels: rows.map(r => r.t),
-      datasets: [{ data: rows.map(r => r.v), borderColor: "#00ff88", tension: 0.3, pointRadius: 0, fill: false }]
-    },
-    options: {
-      plugins: { legend: { display: false } },
-      scales: { x: { ticks: { color: "#888", maxTicksLimit: 5 } }, y: { ticks: { color: "#888" } } }
-    }
-  });
-});
-</script>
-{% endraw %}
-</body></html>
-"""
-
-
-@app.route("/")
-def index():
-    return render_template_string(TEMPLATE, d=get_dashboard(), ttl=CACHE_TTL, mins=SNAPSHOT_EVERY // 60)
-
-
-@app.route("/api/history")
-def api_history():
-    return jsonify(load_history())
-
-
-@app.route("/health")
-def health():
-    return "ok"
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
